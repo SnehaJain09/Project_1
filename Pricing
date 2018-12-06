@@ -1,0 +1,218 @@
+#-----------------------Creating COSS Dataset------------------------------------------#
+install.packages("Hmisc")
+install.packages("sqldf")
+install.packages("readxl")
+library(RODBC)
+library(dplyr)
+library(Hmisc)
+library(sqldf)
+library(readxl)
+
+#Establishing connection with Sql Server
+cn = odbcDriverConnect(connection="Driver={SQL Server Native Client 11.0};
+                        server=localhost;
+                        database=CromwellDiscountOptimisation;
+                        trusted_connection=yes;")
+
+#Getting data of COSS Accounts from sql 
+coss_data = sqlQuery(cn ,"select * from Cromwell_Mastertable
+                where Account_type_used  ='COSS Accounts'" )
+
+#-------------------------------------------------------------------------------------------------
+
+#Check for Discount <0
+neg_disc = which(coss_data$discount < 0)
+if(length(neg_disc) == 0 ){
+  print("No Negative Discount Found In Data!")
+}else{
+  disc_neg =  subset(coss_data, coss_data$discount <0)
+  coss_data = coss_data[setdiff(rownames(coss_data),rownames(disc_neg)),]
+}
+
+#--------------------------------------------------------------------------------------------------
+
+#Getting top categories contributing 80% to total revenue
+coss_subset = coss_data[,c("name_web_segmentation_level_2","total_price")]
+top_rev_cat <- group_by(coss_subset,name_web_segmentation_level_2) %>% 
+  summarise(total_price = sum(total_price)) %>% 
+  arrange(desc(total_price))
+  
+
+overall_tp = sum(top_rev_cat$total_price)
+top_rev_cat$percentof_total_price = top_rev_cat$total_price/overall_tp
+top_rev_cat$percentof_total_price =round((top_rev_cat$percentof_total_price*100),1)
+
+for(i in 2:length(top_rev_cat$percentof_total_price)){
+  top_rev_cat$cumulative_per[1] = top_rev_cat$percentof_total_price[1]
+  top_rev_cat$cumulative_per[i] = sum( top_rev_cat$percentof_total_price[i]+ top_rev_cat$cumulative_per[i-1])
+}
+
+number_top_cate = which(grepl(81,top_rev_cat$cumulative_per))
+
+top_categories = top_rev_cat$name_web_segmentation_level_2[1:number_top_cate]
+
+print(top_categories)
+#--------------------------------------------------------------------------------------------------------------------------------------
+
+# Finding out Quantiles for top categories taken together
+coss_quant = coss_data[coss_data$name_web_segmentation_level_2 %in% top_categories,]
+quantile(coss_quant$qty_inv)
+quantile(coss_quant$qty_inv,probs = c(0.2,0.4,0.6,0.8,1.0))
+
+#Finding Quantiles for each top categories 
+for(i in 1:number_top_cate){
+  print(top_categories[i])
+  category = coss_data[coss_data$name_web_segmentation_level_2 == top_categories[i],]
+  print(quantile(category$qty_inv))
+  print(quantile(category$qty_inv,probs = seq(0.2, 1, by = 0.20)))
+}
+
+#---------------------------------------------------------------------------------------------------------------------------------------
+
+#Creating Volumetric Buckets and pasting it in entire dataset
+
+coss_data = sqldf(
+ "select *,
+  CASE
+  WHEN [qty_inv]=1 THEN 'B1:1'
+  WHEN [qty_inv]=2 THEN 'B2:2'
+  WHEN [qty_inv]>2 and [qty_inv]<=5 THEN 'B3:3 to 5'
+  WHEN [qty_inv]>=6 THEN 'B4:>=6'
+  end
+  as Bucket
+  FROM coss_data"
+)
+
+#Check for NA in Bucket column
+sum(is.na(coss_data$Bucket))
+
+#--------------------------------------------------------------------------------------------------------------
+#Rolling up dataset at Customer level 
+
+cust_level_agg = sqldf("SELECT 
+[Customer_identifier],
+[Account_type_used],
+[name_brand_type],
+[name_web_segmentation_level_2],
+count(*) as countofrecords,
+[Bucket],
+SUM(qty_inv) AS [Total Qty_inv],
+SUM([std_price]) AS [Gross Std_price GBP],
+sum([uoi]) AS [Total uoi],
+SUM([unit_price]) AS [Gross Unit_price GBP],
+SUM([total_price]) AS [Gross Total_price GBP],
+SUM([total_cost]) AS [Gross Total_cost GBP],
+SUM([margin]) AS [Net Margin GBP],
+SUM([discount]) AS [Net Discount GBP],
+SUM(std_price_calc) AS [Gross std_price_calc GBP],
+ROUND((SUM([discount])/SUM([std_price_calc])),2) AS [Avg_Cust_Disc_Percent]
+from coss_data
+group by [Customer_identifier],[Account_type_used],[name_brand_type],[name_web_segmentation_level_2],[Bucket]")
+
+#---------------------------------------------------------------------------------------------------------------------------------------
+
+# Rolling up dataset at Group Level 
+
+grp_level_agg = sqldf("SELECT
+                      [Account_type_used],
+                      [name_brand_type],
+                      [name_web_segmentation_level_2],
+                      [Bucket],
+                      count(*) as countofrecords,
+                      SUM(qty_inv) AS [Total Qty_inv],
+                      SUM([std_price]) AS [Gross Std_price GBP],
+                      sum([uoi]) AS [Total uoi],
+                      SUM([unit_price]) AS [Gross Unit_price GBP],
+                      SUM([total_price]) AS [Gross Total_price GBP],
+                      SUM([total_cost]) AS [Gross Total_cost GBP],
+                      SUM([margin]) AS [Net Margin GBP],
+                      SUM([discount]) AS [Net Discount GBP],
+                      SUM(std_price_calc) AS [Gross std_price_calc GBP],
+                      ROUND((SUM([discount])/SUM([std_price_calc])),2) AS [Avg_Grp_Disc_Percent]
+                      from coss_data
+                      group by [Account_type_used],[name_brand_type],[name_web_segmentation_level_2],[Bucket]")
+
+#-------------------------------------------------------------------------------------------------------------------------------------------
+
+#Copying grp_dis% to cust_level_agg
+
+cust_level_agg = sqldf("select
+a.*,b.[Avg_Grp_Disc_Percent]
+from cust_level_agg
+as a left outer join grp_level_agg as b 
+on 
+a.name_brand_type =b.name_brand_type and 
+a.name_web_segmentation_level_2 = b.name_web_segmentation_level_2 and
+a.Bucket =b.Bucket")
+
+#--------------------------------------------------------------------------------------------------------------------------------------------
+# Adding national brand avg to Own brand
+
+# coss_data_grp_without_disctyp = sqlQuery(cn, "select * from [dbo].[Aggregated COSS_Accounts_Group_Without_DiscType]")
+grp_level_agg$NationalBrand_Grp_Disc = ifelse(grp_level_agg$name_brand_type =="National Brand", grp_level_agg$Avg_Grp_Disc_Percent,0)
+
+key = paste0(grp_level_agg$name_web_segmentation_level_2,'-',
+             grp_level_agg$Bucket)
+
+grp_level_agg$key = key
+
+for(i in 1:nrow(grp_level_agg)){
+  if(grp_level_agg$name_brand_type[i] =="National Brand"){
+    nat_disc = grp_level_agg$Avg_Grp_Disc_Percent[i]
+    key1 = grp_level_agg$key[i]
+    # print (nat_disc)
+    # print(key1)
+    
+    for(j in 1:nrow(grp_level_agg)){
+      if(grp_level_agg$name_brand_type[j] == "Own Brand" & grp_level_agg$key[j] == key1){
+        # print(coss_data_grp_without_disctyp$name_brand_type[j])
+        # print(coss_data_grp_without_disctyp$key[j])
+        grp_level_agg$NationalBrand_Grp_Disc[j] = nat_disc
+        # print(coss_data_grp_without_disctyp$NationalAcct_Grp_Disc[j])
+        break
+      }
+      
+    }
+    
+  }
+  # print(i)  
+}
+
+
+grp_level_agg$key = NULL
+#-----------------------------------------------------------------------------------------------------------------------
+
+#Copying NationalBrand_Grp_Disc to cust_level_agg
+
+cust_level_agg = sqldf("select
+                       a.*,b.[NationalBrand_Grp_Disc]
+                       from cust_level_agg
+                       as a left outer join grp_level_agg as b 
+                       on 
+                       a.name_brand_type =b.name_brand_type and 
+                       a.name_web_segmentation_level_2 = b.name_web_segmentation_level_2 and
+                       a.Bucket =b.Bucket")
+#--------------------------------------------------------------------------------------------------------------------------
+
+#Calculating Weightage grp disc% for Own Brand giving 60% weightage to National  Brand and 40% to Own Brand
+#For Categoriees with Own Brand with no corresponding National Brand 100% weightage given to Own Brand
+
+cust_level_agg$Weighted_Grp_Dis_Percent = (cust_level_agg$NationalBrand_Grp_Disc * 0.6)+
+  (cust_level_agg$Avg_Grp_Disc_Percent * 0.4)
+
+for(i in 1:nrow(cust_level_agg)){
+  if(cust_level_agg$NationalBrand_Grp_Disc[i] ==0) {
+    cust_level_agg$Weighted_Grp_Dis_Percent[i] = cust_level_agg$Avg_Grp_Disc_Percent[i]
+  }
+}
+cust_level_agg$Weighted_Grp_Dis_Percent = round(cust_level_agg$Weighted_Grp_Dis_Percent,2)
+#-------------------------------------------------------------------------------------------------------------------------------------------
+
+#Potential Opportunity Calculation (Scenarios)
+
+for(i in 1:nrow(cust_level_agg)){
+  if ((cust_level_agg$Avg_Cust_Disc_Percent[i]-cust_level_agg$Avg_Grp_Disc_Percent[i]>0.05 )&
+      (cust_level_agg$Avg_Cust_Disc_Percent[i]-cust_level_agg$Avg_Grp_Disc_Percent[i] <0.1))
+    
+   cust_level_agg$R2_Laddered_disc =  cust_level_agg$`Gross Std_price GBP` - (cust_level_agg$`Gross Std_price GBP` * (cust_level_agg$Weighted_Grp_Dis_Percent - 0.05))
+}
