@@ -1,0 +1,159 @@
+install.packages("RODBC")
+library(RODBC)
+library(openxlsx)
+library(dplyr)
+library(writexl)
+
+
+cn <- odbcDriverConnect(connection="Driver={SQL Server Native Client 11.0};
+                        server=localhost;
+                        database=CromwellDiscountOptimisation;
+                        trusted_connection=yes;")
+
+cromwell_data <- sqlQuery(cn, 'select 
+                          Account_type_used,
+                          part,qty_inv,uoi,std_price,unit_price,total_cost,total_price,
+                          name_web_segmentation_level_2,margin,discount,std_price_calc,
+                          Month_18_Name
+                          from dbo.Cromwell_Feb18_to_Aug18')
+
+
+competitor_data = read.xlsx("E:/Cromwell/Data/Competitor Data.xlsx",rowNames = FALSE)
+
+
+names(competitor_data) <- gsub("\\.", " ", names(competitor_data))
+
+
+
+combined_data = left_join(cromwell_data,competitor_data,
+                          by =c("part" ="SKU",
+                                "Month_18_Name"= "Month of 2018"))
+
+
+combined_data_1 = combined_data
+
+#Calculating Price Position for each Competitor
+combined_data_1$PriceIndex_Arco = round(combined_data_1$`Arco Price`/as.numeric(combined_data_1$`Our Price`),2)
+combined_data_1$PriceIndex_Brammer= round(as.numeric(combined_data_1$`Brammer Prices`)/as.numeric(combined_data_1$`Our Price`),2)
+combined_data_1$PriceIndex_BuckHickman = round(combined_data_1$`Buck & Hickman Price`/as.numeric(combined_data_1$`Our Price`),2)
+combined_data_1$PriceIndex_Hoffman = round(as.numeric(combined_data_1$`Hoffman Prices`)/as.numeric(combined_data_1$`Our Price`),2)
+combined_data_1$PriceIndex_MSC = round(as.numeric(combined_data_1$`MSC Prices`)/as.numeric(combined_data_1$`Our Price`),2)
+combined_data_1$PriceIndex_RSComp = round(as.numeric(combined_data_1$`RS Component Price`)/as.numeric(combined_data_1$`Our Price`),2)
+combined_data_1$PriceIndex_Screwfix = round(as.numeric(combined_data_1$`Screwfix Prices`)/as.numeric(combined_data_1$`Our Price`),2)
+combined_data_1$PriceIndex_WorldOfSupply = round(as.numeric(combined_data_1$`WorldofSupply Prices`)/as.numeric(combined_data_1$`Our Price`),2)
+
+
+# Calculating Weighted Avg price position for each competitor
+combined_data_1$WeightedIndex_Arco = combined_data_1$total_price * combined_data_1$PriceIndex_Arco
+combined_data_1$WeightedIndex_Brammer = combined_data_1$total_price * combined_data_1$PriceIndex_Brammer
+combined_data_1$WeightedIndex_BuckHickman = combined_data_1$total_price * combined_data_1$PriceIndex_BuckHickman
+combined_data_1$WeightedIndex_Hoffman = combined_data_1$total_price * combined_data_1$PriceIndex_Hoffman
+combined_data_1$WeightedIndex_MSC = combined_data_1$total_price * combined_data_1$PriceIndex_MSC 
+combined_data_1$WeightedIndex_RSComp = combined_data_1$total_price * combined_data_1$PriceIndex_RSComp
+combined_data_1$WeightedIndex_Screwfix = combined_data_1$total_price * combined_data_1$PriceIndex_Screwfix
+combined_data_1$WeightedIndex_WorldOfSupply = combined_data_1$total_price * combined_data_1$PriceIndex_WorldOfSupply 
+
+
+#Calculation of Pi_Above & Pi_Below
+price_position = select(combined_data_1,39:46)
+price_position[is.na(price_position)] = 0
+price_position$new = 1.00
+price_position = as.data.frame(t(apply(price_position, 1, sort)))
+ 
+# price_position$position <- apply(price_position,1,function(x) match(1,x, nomatch=99 ))
+
+#price_position$PI_Below = NA
+#price_position$PI_Above = NA
+
+#price_position  
+
+#test<-test[,c("Col5","Col6","Col7","Col8","Col9","Col10")]
+
+price_position$PI_Below = 0
+price_position$PI_Above = 0
+
+for(i in 1:9){
+  if(i==1){
+    price_position$PI_Above = ifelse(price_position[,i]==1 & price_position[,c("PI_Above")]!=1,price_position[,i+1],price_position[,c("PI_Above")]) 
+  }else if(i==9){
+    price_position$PI_Below = ifelse(price_position[,i]==1 & price_position[,c("PI_Below")]!=1,price_position[,i-1],price_position[,c("PI_Below")])
+  }else {
+   price_position$PI_Below = ifelse(price_position[,i]==1 & price_position[,c("PI_Below")]!=1,price_position[,i-1],price_position[,c("PI_Below")])
+   price_position$PI_Above = ifelse(price_position[,i]==1 & price_position[,c("PI_Above")]!=1,price_position[,i+1],price_position[,c("PI_Above")])
+   }
+}
+
+
+
+price_position[price_position == 0] <- NA
+price_position_new = price_position[,10:11]
+all_data = cbind(combined_data_1,price_position_new)
+class(all_data$PI_Below)
+class(all_data$PI_Above)
+all_data$PI_Below = as.numeric(all_data$PI_Below)
+all_data$WI_Below = round((all_data$PI_Below*all_data$total_price),2)
+all_data$WI_Above = round((all_data$PI_Above*all_data$total_price),2)
+
+ df_pibelow = all_data[!is.na(all_data$WI_Below), ]
+
+# df_Wi_below = df_pibelow  %>% 
+#   group_by(name_brand_type,name_web_segmentation_level_2,Month_18_Name) %>% 
+#   summarise(Agg_WI_Below =sum(WI_Below),
+#             Agg_total_price = sum(total_price))
+
+df_Wi_below = df_pibelow %>% 
+  group_by(name_web_segmentation_level_2,Month_18_Name) %>% 
+  summarise(Agg_WI_Below = sum(WI_Below),
+            Agg_total_price = sum(total_price))
+
+df_Wi_below$WAPP_Below = round((df_Wi_below$Agg_WI_Below/df_Wi_below$Agg_total_price),2)
+#--------------------------------------------------------------------------------------------------
+
+df_piabove = all_data[!is.na(all_data$WI_Above), ]
+
+# df_Wi_above = df_piabove  %>% 
+#   group_by(name_brand_type,name_web_segmentation_level_2,Month_18_Name) %>% 
+#   summarise(Agg_WI_Above =sum(WI_Above),
+#             Agg_total_price = sum(total_price))
+
+df_Wi_above = df_piabove %>% 
+  group_by(name_web_segmentation_level_2,Month_18_Name) %>% 
+  summarise(Agg_WI_Above =sum(WI_Above),
+            Agg_total_price = sum(total_price))
+
+df_Wi_above$WAPP_Above = round((df_Wi_above$Agg_WI_Above/df_Wi_above$Agg_total_price),2)
+
+#----------------------------------------------------------------------------------------------------------
+combined_data_final1 = left_join(all_data,df_Wi_below,
+                                 by =c("name_web_segmentation_level_2"="name_web_segmentation_level_2",
+                                       "Month_18_Name"="Month_18_Name")) 
+
+combined_data_final2 = left_join(combined_data_final1,df_Wi_above,
+                                 by =c("name_web_segmentation_level_2"="name_web_segmentation_level_2",
+                                       "Month_18_Name"="Month_18_Name")) 
+
+
+drops = c("Category - L1","Category - L2",
+                                      "Title","Brand","EAN","MPN","Our Price",
+                                      "UOI","Arco SKU","Arco Price",
+                                      "Brammer SKU","Brammer Prices","Buck & Hickman SKU",
+                                      "Buck & Hickman Price","Hoffman SKU","Hoffman Prices",
+                                      "MSC SKU","MSC Prices" ,"RS Component SKU",
+                                      "RS Component Price","Screwfix SKU","Screwfix Prices",
+                                      "WorldofSupply SKU","WorldofSupply Prices","Agg_WI_Below","Agg_total_price.x",
+                                      "Agg_WI_Above","Agg_total_price.y")
+
+
+final_data <- combined_data_final2[, ! names(combined_data_final2) %in% drops, drop = F]
+
+
+write.csv(final_data,"WAPP_Calculation.csv",row.names = FALSE)
+
+#--------------------------------------------------------------------------------------------------
+
+wapp_table = read.csv("E:/Cromwell/Sneha/10_dec/WAPP_Calculation.csv")
+
+before = Sys.time()
+sqlSave(cn,wapp_table,tablename = "WAPP_Calc",append = FALSE,rownames = TRUE,colnames = FALSE)
+time_infile = Sys.time() - before 
+
