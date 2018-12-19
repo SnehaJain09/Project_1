@@ -1,0 +1,421 @@
+#-----------------------Required Packages & Libraries ------------------------------------------#
+# install.packages("Hmisc")
+install.packages("sqldf")
+install.packages("readxl")
+library(RODBC)
+library(dplyr)
+# library(Hmisc)
+library(sqldf)
+library(readxl)
+
+
+#Establishing connection with Sql Server
+cn = odbcDriverConnect(connection="Driver={SQL Server Native Client 11.0};
+                       server=localhost;
+                       database=CromwellDiscountOptimisation;
+                       trusted_connection=yes;")
+
+#-----------------------------------------------------------------------------------------------------------
+
+#Getting all data from the Mastertable from Sql in R 
+# and creating separate dataframes for each Account Type other than National Accounts
+
+data = sqlQuery(cn,"select * from Cromwell_Mastertable where Account_type_used not like 'National Accounts'")
+
+# data_non_national = filter(data, !grepl("National Accounts",data$Account_type_used))
+
+account_name = unique(data$Account_type_used)
+
+acct_type = length(account_name)
+
+for(i in 1:length(account_name)){
+  name = paste(account_name[i],sep = "")
+  d = filter(data, grepl(account_name[i],data$Account_type_used))
+  assign(name,d) 
+}
+#-------------------------------------------------------------------------------------------------------------
+
+#Check for Discount <0 and remove them from dataset
+
+for(i in 1:length(account_name)){
+  name = paste("df","_",account_name[i],sep = "")
+  df = filter(data, grepl(account_name[i],data$Account_type_used))
+  delete_neg_disc(df)
+}
+
+# Function to remove Negative Discounts From Dataset of Different Accounts
+delete_neg_disc <- function(df_account) {
+  neg_disc = which(df_account$discount < 0)
+  if(length(neg_disc) == 0 ){
+    print("Negative Discount Not Found In Data!")
+    print(unique(df_account$Account_type_used))
+  }else{
+    disc_neg =  subset(df_account, df_account$discount <0)
+    df_account = df_account[setdiff(rownames(df_account),rownames(disc_neg)),]
+    print("Negative Discount Removed from Data")
+    print(unique(df_account$Account_type_used))
+  }
+  return(df_account)
+}
+
+#----------------------------------------------------------------------------------------------------------------------------
+#Renaming data frames 
+coss = `COSS Accounts`
+group = `Group Accounts`
+non_corp = `Non-Corporate Accounts`
+
+rm(`COSS Accounts`,`Group Accounts`,`Non-Corporate Accounts`)
+
+#--------------------------------------------------------------------------------------------------------------------
+
+#Function to find top categories contributing 80% of revenue
+top_subcategory <- function(df){
+  df_subset = df[,c("name_web_segmentation_level_2","total_price")]
+  top_rev_cat <- group_by(df_subset,name_web_segmentation_level_2) %>% 
+    summarise(total_price = sum(total_price)) %>% 
+    arrange(desc(total_price))
+  
+  
+  overall_tp = sum(top_rev_cat$total_price)
+  top_rev_cat$percentof_total_price = top_rev_cat$total_price/overall_tp
+  top_rev_cat$percentof_total_price =round((top_rev_cat$percentof_total_price*100),1)
+  
+  for(i in 2:length(top_rev_cat$percentof_total_price)){
+    top_rev_cat$cumulative_per[1] = top_rev_cat$percentof_total_price[1]
+    top_rev_cat$cumulative_per[i] = sum( top_rev_cat$percentof_total_price[i]+ top_rev_cat$cumulative_per[i-1])
+  }
+  top_rev_cat$cumulative_per = round(top_rev_cat$cumulative_per,0)
+  number_top_cate = which(grepl(81,top_rev_cat$cumulative_per))
+  
+  top_categories = top_rev_cat$name_web_segmentation_level_2[1:number_top_cate]
+  
+  print(paste("Top",number_top_cate, "Categories of",":-",unique(df$Account_type_used)))
+  print(top_categories)
+  return(top_categories)
+  
+}
+
+top_categories_coss = top_subcategory(coss)
+top_categories_group = top_subcategory(group)
+top_categories_non_corp = top_subcategory(non_corp)
+
+#--------------------------------------------------------------------------------------------------------------------------------
+
+# Finding out Quantiles for top categories irrespective of Brand Type i.e. National or Own Brand
+
+quantile_calc = function(df,top_categories){
+  print(paste("Quantiles of ",unique(df$Account_type_used)))
+  df_quant = df[df$name_web_segmentation_level_2 %in% top_categories,]
+  quantile(df_quant$qty_inv,probs = seq(0.25,1, by=0.25))
+  quantile(df_quant$qty_inv,probs = c(0.2,0.4,0.6,0.8,1.0))
+}
+
+#Finding Quantiles for each top categories irrespective of Brand
+quantile_each_category = function(df,top_categories){
+  number_top_cate = length(top_categories)
+  for(i in 1:number_top_cate){
+    print(top_categories[i])
+    category = df[df$name_web_segmentation_level_2 == top_categories[i],]
+    print(quantile(category$qty_inv,probs = seq(0.25,1, by=0.25)))
+    print(quantile(category$qty_inv,probs = seq(0.2, 1, by = 0.20)))
+  }
+}
+
+
+quantile_calc(coss,top_categories_coss)
+quantile_calc(group,top_categories_group)
+quantile_calc(non_corp,top_categories_non_corp)
+
+
+quantile_each_category(coss,top_categories_coss)
+quantile_each_category(group,top_categories_group)
+quantile_each_category(non_corp,top_categories_non_corp)
+
+
+#------------------------------------------------------------------------------------------------------------------
+
+#Creating Volumetric Buckets and pasting it in entire dataset
+binning = function(df){
+  df = sqldf(
+    "select *,
+  CASE
+  WHEN [qty_inv]=1 THEN 'B1:1'
+  WHEN [qty_inv]=2 THEN 'B2:2'
+  WHEN [qty_inv]>2 and [qty_inv]<=5 THEN 'B3:3 to 5'
+  WHEN [qty_inv]>=6 THEN 'B4:>=6'
+  end
+  as Bucket
+  FROM df"
+  )
+  return (df)
+}
+
+
+coss_bins = binning(coss)
+group_bins = binning(group)
+noncorp_bins = binning(non_corp)
+
+
+#Check for NA in Bucket column
+sum(is.na(coss_bins$Bucket))
+sum(is.na(group_bins$Bucket))
+sum(is.na(noncorp_bins$Bucket))
+
+#---------------------------------------------------------------------------------------------------------------------------
+
+#Rolling up dataset at Customer level 
+customer_level_rollup = function(df){
+  cust_level_agg = sqldf("SELECT 
+                       [Customer_identifier],
+                       [Account_type_used],
+                       [name_brand_type],
+                       [name_web_segmentation_level_2],
+                       count(*) as countofrecords,
+                       [Bucket],
+                       SUM(qty_inv) AS [Total Qty_inv],
+                       SUM([std_price]) AS [Gross Std_price GBP],
+                       sum([uoi]) AS [Total uoi],
+                       SUM([unit_price]) AS [Gross Unit_price GBP],
+                       SUM([total_price]) AS [Gross Total_price GBP],
+                       SUM([total_cost]) AS [Gross Total_cost GBP],
+                       SUM([margin]) AS [Net Margin GBP],
+                       SUM([discount]) AS [Net Discount GBP],
+                       SUM(std_price_calc) AS [Gross std_price_calc GBP],
+                       ROUND((SUM([discount])/SUM([std_price_calc])),2) AS [Avg_Cust_Disc_Percent]
+                       from df
+                       group by [Customer_identifier],[Account_type_used],[name_brand_type],[name_web_segmentation_level_2],[Bucket]")
+  return(cust_level_agg)
+}
+
+coss_cust_rollup = customer_level_rollup(coss_bins)
+group_cust_rollup = customer_level_rollup(group_bins)
+noncorp_cust_rollup = customer_level_rollup(noncorp_bins)
+
+
+#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Rolling up dataset at Group Level 
+
+grp_level_rollup = function(df){
+  grp_level_agg = sqldf("SELECT
+                      [Account_type_used],
+                      [name_brand_type],
+                      [name_web_segmentation_level_2],
+                      [Bucket],
+                      count(*) as countofrecords,
+                      SUM(qty_inv) AS [Total Qty_inv],
+                      SUM([std_price]) AS [Gross Std_price GBP],
+                      sum([uoi]) AS [Total uoi],
+                      SUM([unit_price]) AS [Gross Unit_price GBP],
+                      SUM([total_price]) AS [Gross Total_price GBP],
+                      SUM([total_cost]) AS [Gross Total_cost GBP],
+                      SUM([margin]) AS [Net Margin GBP],
+                      SUM([discount]) AS [Net Discount GBP],
+                      SUM(std_price_calc) AS [Gross std_price_calc GBP],
+                      ROUND((SUM([discount])/SUM([std_price_calc])),2) AS [Avg_Grp_Disc_Percent]
+                      from df
+                      group by [Account_type_used],[name_brand_type],[name_web_segmentation_level_2],[Bucket]")
+  return(grp_level_agg)
+}
+
+coss_grp_rollup = grp_level_rollup(coss_bins)
+group_grp_rollup = grp_level_rollup(group_bins)
+noncorp_grp_rollup = grp_level_rollup(noncorp_bins)
+
+#-------------------------------------------------------------------------------------------------------------------------------------------
+
+#Copying grp_dis% to cust_level_agg
+
+copy_grpdisc_to_custdata = function(cust_level_agg,grp_level_agg){
+  cust_grp_disc = sqldf("select
+                       a.*,b.[Avg_Grp_Disc_Percent]
+                       from cust_level_agg
+                       as a left outer join grp_level_agg as b 
+                       on 
+                       a.name_brand_type =b.name_brand_type and 
+                       a.name_web_segmentation_level_2 = b.name_web_segmentation_level_2 and
+                       a.Bucket =b.Bucket")
+  return(cust_grp_disc)
+}
+
+
+coss_cust_grp_disc = copy_grpdisc_to_custdata(coss_cust_rollup,coss_grp_rollup)
+group_cust_grp_disc = copy_grpdisc_to_custdata(group_cust_rollup,group_grp_rollup)
+noncorp_cust_grp_disc = copy_grpdisc_to_custdata(noncorp_cust_rollup,noncorp_grp_rollup)
+
+#--------------------------------------------------------------------------------------------------------------------------------------------
+
+# Adding column of National Brand discount percentage for weightage calculation
+
+
+nationalBrand_column = function(grp_level_agg){
+  grp_level_agg$NationalBrand_Grp_Disc = ifelse(grp_level_agg$name_brand_type =="National Brand", grp_level_agg$Avg_Grp_Disc_Percent,0)
+  
+  key = paste0(grp_level_agg$name_web_segmentation_level_2,'-',
+               grp_level_agg$Bucket)
+  
+  grp_level_agg$key = key
+  
+  for(i in 1:nrow(grp_level_agg)){
+    if(grp_level_agg$name_brand_type[i] =="National Brand"){
+      nat_disc = grp_level_agg$Avg_Grp_Disc_Percent[i]
+      key1 = grp_level_agg$key[i]
+      # print (nat_disc)
+      # print(key1)
+      
+      for(j in 1:nrow(grp_level_agg)){
+        if(grp_level_agg$name_brand_type[j] == "Own Brand" & grp_level_agg$key[j] == key1){
+          # print(coss_data_grp_without_disctyp$name_brand_type[j])
+          # print(coss_data_grp_without_disctyp$key[j])
+          grp_level_agg$NationalBrand_Grp_Disc[j] = nat_disc
+          # print(coss_data_grp_without_disctyp$NationalAcct_Grp_Disc[j])
+          break
+        }
+        
+      }
+      
+    }
+    # print(i)  
+  }
+  
+  
+  grp_level_agg$key = NULL
+  
+  return(grp_level_agg)
+}
+
+
+coss_grp_rollup = nationalBrand_column(coss_grp_rollup)
+group_grp_rollup = nationalBrand_column(group_grp_rollup)
+noncorp_grp_rollup = nationalBrand_column(noncorp_grp_rollup)
+
+#-----------------------------------------------------------------------------------------------------------------------
+
+#Copying National Brand grp_dis% to cust_level_agg
+
+copy_Natdisc_to_custdata = function(cust_level_agg,grp_level_agg){
+  cust_grp_disc = sqldf("select
+                        a.*,b.[NationalBrand_Grp_Disc]
+                        from cust_level_agg
+                        as a left outer join grp_level_agg as b 
+                        on 
+                        a.name_brand_type =b.name_brand_type and 
+                        a.name_web_segmentation_level_2 = b.name_web_segmentation_level_2 and
+                        a.Bucket =b.Bucket")
+  return(cust_grp_disc)
+}
+
+coss_cust_grp_disc = copy_Natdisc_to_custdata(coss_cust_grp_disc,coss_grp_rollup)
+group_cust_grp_disc = copy_Natdisc_to_custdata(group_cust_grp_disc,group_grp_rollup)
+noncorp_cust_grp_disc = copy_Natdisc_to_custdata(noncorp_cust_grp_disc,noncorp_grp_rollup)
+
+
+#--------------------------------------------------------------------------------------------------------------------------------------------
+
+#Calculating Weightage grp disc% for Own Brand giving 60% weightage to National  Brand and 40% to Own Brand
+#For Categoriees with Own Brand with no corresponding National Brand 100% weightage given to Own Brand
+
+weighted_grp_disc = function(cust_level_agg,x){
+  cust_level_agg$Weighted_Grp_Dis_Percent = (cust_level_agg$NationalBrand_Grp_Disc * x)+
+    (cust_level_agg$Avg_Grp_Disc_Percent * (1-x))
+  
+  for(i in 1:nrow(cust_level_agg)){
+    if(cust_level_agg$NationalBrand_Grp_Disc[i] == 0) {
+      cust_level_agg$Weighted_Grp_Dis_Percent[i] = cust_level_agg$Avg_Grp_Disc_Percent[i]
+    }
+  }
+  cust_level_agg$Weighted_Grp_Dis_Percent = round(cust_level_agg$Weighted_Grp_Dis_Percent,2)
+  
+  return(cust_level_agg)
+}
+
+
+coss_df = weighted_grp_disc(coss_cust_grp_disc,0.6)
+group_df = weighted_grp_disc(group_cust_grp_disc,0.6)
+noncorp_df = weighted_grp_disc(noncorp_cust_grp_disc,0.6)
+
+
+#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#Potential Opportunity Calculation (RHS Scenarios)
+
+# Scenario R1: Shift by 5% and 10%
+
+
+scenario_5_percent_shift = function(cust_level_agg,x){
+  for(i in 1:nrow(cust_level_agg)){
+    if (cust_level_agg$Avg_Cust_Disc_Percent[i] - cust_level_agg$Weighted_Grp_Dis_Percent[i] > x ){
+      cust_level_agg$R1_Shift_By_5_percent[i] =  round((cust_level_agg$`Gross std_price_calc GBP`[i] - (cust_level_agg$`Gross std_price_calc GBP`[i] * (cust_level_agg$Avg_Cust_Disc_Percent[i] - x))) - cust_level_agg$`Gross Total_price GBP`[i],2)
+    }else
+    {
+      cust_level_agg$R1_Shift_By_5_percent[i] = 0
+    }
+  }
+  return(cust_level_agg)
+}
+
+coss_df = scenario_5_percent_shift(coss_df,0.05)
+group_df = scenario_5_percent_shift(group_df,0.05)
+noncorp_df = scenario_5_percent_shift(noncorp_df,0.05)
+
+coss_df = scenario_5_percent_shift(coss_df,0.1)
+group_df = scenario_5_percent_shift(group_df,0.1)
+noncorp_df = scenario_5_percent_shift(noncorp_df,0.1)
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#Laddered Discount Scenarios
+
+laddered_disc = function(cust_level_agg){
+  for(i in 1:nrow(cust_level_agg)){
+    if ((cust_level_agg$Avg_Cust_Disc_Percent[i]- cust_level_agg$Weighted_Grp_Dis_Percent[i] > 0.05 )&
+        (cust_level_agg$Avg_Cust_Disc_Percent[i]- cust_level_agg$Weighted_Grp_Dis_Percent[i] < 0.1)){
+      
+      cust_level_agg$R2_Laddered_disc[i] =  (cust_level_agg$`Gross std_price_calc GBP`[i] - (cust_level_agg$`Gross std_price_calc GBP`[i] * (cust_level_agg$Avg_Cust_Disc_Percent[i] - 0.05))) - cust_level_agg$`Gross Total_price GBP`[i]
+    }else if(cust_level_agg$Avg_Cust_Disc_Percent[i]- cust_level_agg$Weighted_Grp_Dis_Percent[i] > 0.1){
+      cust_level_agg$R2_Laddered_disc[i] =  (cust_level_agg$`Gross std_price_calc GBP`[i] - (cust_level_agg$`Gross std_price_calc GBP`[i] * (cust_level_agg$Avg_Cust_Disc_Percent[i] - 0.1)))- cust_level_agg$`Gross Total_price GBP`[i]
+    }else{
+      cust_level_agg$R2_Laddered_disc[i] = 0
+    }
+  }
+  return(cust_level_agg)
+}
+
+coss_df = laddered_disc(coss_df)
+group_df = laddered_disc(group_df)
+noncorp_df = laddered_disc(noncorp_df)
+
+#------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#Potential Opportunity Calculation (LHS Scenarios)
+
+lhs_scenario = function(cust_level_agg,x){
+  for(i in 1:nrow(cust_level_agg)){
+    if (cust_level_agg$Weighted_Grp_Dis_Percent[i] - cust_level_agg$Avg_Cust_Disc_Percent[i] > x ){
+      cust_level_agg$L1_Shift_By_2_percent[i] =  (cust_level_agg$`Gross std_price_calc GBP`[i] - (cust_level_agg$`Gross std_price_calc GBP`[i] * (cust_level_agg$Avg_Cust_Disc_Percent[i] + x))) - cust_level_agg$`Gross Total_price GBP`[i]
+    }else
+    {
+      cust_level_agg$L1_Shift_By_2_percent[i] = 0
+    }
+  }
+  return(cust_level_agg)
+}
+
+coss_df = lhs_scenario(coss_df,0.02)
+group_df = lhs_scenario(group_df,0.02)
+noncorp_df = lhs_scenario(noncorp_df,0.02)
+
+#------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+write.csv(coss_df,"COSS_data1712.csv")
+write.csv(group_df,"Group_data1712.csv")
+write.csv(noncorp_df,"Non_Corporate_data1712.csv")
+
+#-----------------------------------------------------------------------------------------------------------------------------------------------------
+#Close connection
+close(cn)
+
+#Clear all objects from the environment 
+rm(list=ls(all=TRUE))
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
