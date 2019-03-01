@@ -1,0 +1,314 @@
+library(RODBC)
+library(dplyr)
+library(sqldf)
+library(readxl)
+
+
+#Establishing connection with Sql Server
+cn = odbcDriverConnect(connection="Driver={SQL Server Native Client 11.0};
+                       server=localhost;
+                       database=CromwellDiscountOptimisation;
+                       trusted_connection=yes;")
+
+#-------------------------------------------------------------------------------------------------------------
+
+#Getting National Account  data  from Sql in R 
+
+data = sqlQuery(cn,"select * from Cromwell_MasterDataL1Categories 
+                where Account_type_used='National Accounts'")
+
+#--------------------------------------------------------------------------------------------------------------
+# Filtering dataset on category name and date
+
+data_categ = filter(data,name_web_segmentation_level_1=='03 - Hand Tools')
+df = subset(handtools, invoice_date>= "2018-01-01" & invoice_date <= "2018-12-31")
+
+#--------------------------------------------------------------------------------------------------------------
+
+# Rolling up on category level
+
+subcat_rollup = df %>%
+  group_by(Customer_identifier,customer_group_curr,name_web_segmentation_level_2) %>%
+  summarise(
+    TOTAL_QTY_INV = sum(qty_inv),
+    TOTAL_UOI = sum(uoi),
+    GROSS_STD_PRICE_GBP = sum(converted_std_price),
+    GROSS_UNIT_PRICE_GBP = sum(converted_unit_price),
+    GROSS_TOTAL_PRICE_GBP = sum(converted_total_price),
+    GROSS_TOTAL_COST_GBP = sum(converted_total_cost),
+    NET_MARGIN_GBP = sum(margin),
+    NET_DISCOUNT_GBP = sum(discount),
+    GROSS_STD_PRICE_CALC_GBP = sum(std_price_calc)) 
+
+
+#-----------------------------------------------------------------------------------------------------------------
+
+#Rolling up data on SKU level 
+sku_rollup = handtools_18 %>%
+  group_by(Customer_identifier,customer_group_curr,name_web_segmentation_level_2,part) %>%
+  summarise(
+    TOTAL_QTY_INV = sum(qty_inv),
+    TOTAL_UOI = sum(uoi),
+    GROSS_STD_PRICE_GBP = sum(converted_std_price),
+    GROSS_UNIT_PRICE_GBP = sum(converted_unit_price),
+    GROSS_TOTAL_PRICE_GBP = sum(converted_total_price),
+    GROSS_TOTAL_COST_GBP = sum(converted_total_cost),
+    NET_MARGIN_GBP = sum(margin),
+    NET_DISCOUNT_GBP = sum(discount),
+    GROSS_STD_PRICE_CALC_GBP = sum(std_price_calc)) 
+
+#--------------------------------------------------------------------------------------------------------------------- 
+
+#Function to find top categories contributing 80% of revenue
+ordered_subcategory <- function(df){
+  df_subset = df[,c("name_web_segmentation_level_2","GROSS_TOTAL_PRICE_GBP")]
+  top_rev_cat <- group_by(df_subset,name_web_segmentation_level_2) %>% 
+    summarize(GROSS_TOTAL_PRICE_GBP = sum(GROSS_TOTAL_PRICE_GBP)) %>% 
+    arrange(desc(GROSS_TOTAL_PRICE_GBP))
+  
+  num_categories = length(top_rev_cat$name_web_segmentation_level_2)
+  
+  overall_tp = sum(top_rev_cat$GROSS_TOTAL_PRICE_GBP)
+  top_rev_cat$percentof_total_price = top_rev_cat$GROSS_TOTAL_PRICE_GBP/overall_tp
+  top_rev_cat$percentof_total_price =round((top_rev_cat$percentof_total_price*100),1)
+  
+  for(i in 2:length(top_rev_cat$percentof_total_price)){
+    top_rev_cat$cumulative_per[1] = top_rev_cat$percentof_total_price[1]
+    top_rev_cat$cumulative_per[i] = sum( top_rev_cat$percentof_total_price[i]+ top_rev_cat$cumulative_per[i-1])
+  }
+  # top_rev_cat$cumulative_per = round(top_rev_cat$cumulative_per,0)
+  # number_top_cate = which(grepl(81,top_rev_cat$cumulative_per))
+  
+  top_rev_cat$cumulative_per = round(top_rev_cat$cumulative_per,0)
+  # number_top_cate = which.min(abs(top_rev_cat$cumulative_per - 81)) 
+  # 
+  # top_categories = top_rev_cat$name_web_segmentation_level_2[1:number_top_cate]
+  # 
+  # bottom_categories = top_rev_cat$name_web_segmentation_level_2[number_top_cate+1:num_categories]
+  # 
+  # print(top_categories)
+  # print(bottom_categories)
+  return(top_rev_cat)
+  
+}
+
+ordered_category = ordered_subcategory(subcat_rollup)
+
+
+top_category = function(df){
+  num_categories = length(df$name_web_segmentation_level_2)
+  number_top_cate = which.min(abs(df$cumulative_per - 81)) 
+  top_categories = df$name_web_segmentation_level_2[1:number_top_cate]
+  print(paste("Top",number_top_cate, "Categories of National Account"))
+  print(top_categories)
+}
+
+top_cate = top_category(ordered_category)
+
+
+bottom_category = function(df){
+  num_categories = length(df$name_web_segmentation_level_2)
+  number_top_cate = which.min(abs(df$cumulative_per - 81)) 
+  bottom_categories = df$name_web_segmentation_level_2[number_top_cate+1:num_categories]
+  bottom_categories = na.omit(bottom_categories)
+  print(bottom_categories)
+}
+
+
+bottom_cate = bottom_category(ordered_category)
+
+
+
+#Finding Quantiles for each top categories 
+quantile_calculation = function(df,categories){
+  number_top_cate = length(categories)
+  for(j in 1:number_top_cate){
+    # print(top_categories[j])
+    category = df[df$name_web_segmentation_level_2 == categories[j],]
+    category$Subcat_flag = paste0("#",j)
+    var1 = round(quantile(category$TOTAL_QTY_INV,probs = 0.2),0)
+    var2 = round(quantile(category$TOTAL_QTY_INV,probs = 0.4),0)
+    var3 = round(quantile(category$TOTAL_QTY_INV,probs = 0.6),0)
+    var4 = round(quantile(category$TOTAL_QTY_INV,probs = 0.8),0)
+    var5 = round(quantile(category$TOTAL_QTY_INV,probs = 0.95),0)
+    var6 = round(quantile(category$TOTAL_QTY_INV,probs = 1.0),0)
+    
+    
+    for(i in 1:nrow(category)){
+      if(category$TOTAL_QTY_INV[i] <= var1){
+        category$bucket[i] = paste("B1:",0,"to",var1)
+      }else if(category$TOTAL_QTY_INV[i] > var1 & category$TOTAL_QTY_INV[i]<=var2){
+        category$bucket[i] = paste("B2:",var1+1,"to",var2)
+      }else if(category$TOTAL_QTY_INV[i] > var2 & category$TOTAL_QTY_INV[i]<=var3){
+        category$bucket[i] =paste("B3:",var2+1,"to",var3)
+      }else if(category$TOTAL_QTY_INV[i] > var3 & category$TOTAL_QTY_INV[i]<=var4){
+        category$bucket[i] =paste("B4:",var3+1,"to",var4)
+      }else if(category$TOTAL_QTY_INV[i] > var4 & category$TOTAL_QTY_INV[i]<=var5){
+        category$bucket[i] =paste("B5:",var4+1,"to",var5)
+      }else{
+        category$bucket[i] =paste("B6:Top 5%tile Volume")
+      }
+      
+    }
+    
+    if(j==1){
+      bucket_cate = category 
+    }else{
+      bucket_cate = rbind(bucket_cate,category)
+    }
+    
+  }
+  return(bucket_cate)
+}
+
+
+
+df_top = quantile_calculation(subcat_rollup,top_cate)
+df_bottom= quantile_calculation(subcat_rollup,bottom_cate)
+df_bottom$Subcat_flag = "Bottom Categories,20%rev"
+final_df = rbind(df_top,df_bottom)
+
+
+# rm(df_bucket_top,df_bucket_additional,df_bottom)
+
+write.csv(final_df,"HandTools_Buckets.csv",row.names = FALSE)
+
+#--------------------------------------------------------------------------------------------------------------------------------------------
+
+#Rolling up data on Customer level
+cust_avg_disc = final_df %>%
+  group_by(Customer_identifier,customer_group_curr,name_web_segmentation_level_2,Subcat_flag,bucket) %>%
+  summarise(
+    TOTAL_QTY_INV = sum(TOTAL_QTY_INV),
+    TOTAL_UOI = sum(TOTAL_UOI),
+    GROSS_STD_PRICE_GBP = sum(GROSS_STD_PRICE_GBP),
+    GROSS_UNIT_PRICE_GBP = sum(GROSS_UNIT_PRICE_GBP),
+    GROSS_TOTAL_PRICE_GBP = sum(GROSS_TOTAL_PRICE_GBP),
+    GROSS_TOTAL_COST_GBP = sum(GROSS_TOTAL_COST_GBP),
+    NET_MARGIN_GBP = sum(NET_MARGIN_GBP),
+    NET_DISCOUNT_GBP = sum( NET_DISCOUNT_GBP),
+    GROSS_STD_PRICE_CALC_GBP = sum(GROSS_STD_PRICE_CALC_GBP)) %>%  
+  mutate(Avg_Cust_Disc_Percent =round((sum(NET_DISCOUNT_GBP)/sum(GROSS_STD_PRICE_CALC_GBP)),2))
+
+#---------------------------------------------------------------------------------------------------------------------------------------
+#Rolling up data on Group level
+grp_avg_disc = final_df %>%
+  group_by(name_web_segmentation_level_2,bucket) %>%
+  summarise(
+    TOTAL_QTY_INV = sum(TOTAL_QTY_INV),
+    TOTAL_UOI = sum(TOTAL_UOI),
+    GROSS_STD_PRICE_GBP = sum(GROSS_STD_PRICE_GBP),
+    GROSS_UNIT_PRICE_GBP = sum(GROSS_UNIT_PRICE_GBP),
+    GROSS_TOTAL_PRICE_GBP = sum(GROSS_TOTAL_PRICE_GBP),
+    GROSS_TOTAL_COST_GBP = sum(GROSS_TOTAL_COST_GBP),
+    NET_MARGIN_GBP = sum(NET_MARGIN_GBP),
+    NET_DISCOUNT_GBP = sum( NET_DISCOUNT_GBP),
+    GROSS_STD_PRICE_CALC_GBP = sum(GROSS_STD_PRICE_CALC_GBP)) %>%  
+  mutate(Avg_Grp_Disc_Percent =round((sum(NET_DISCOUNT_GBP)/sum(GROSS_STD_PRICE_CALC_GBP)),2))
+
+#------------------------------------------------------------------------------------------------------------------------------------------
+
+#Copying grp_dis% to cust_level_agg
+
+cust_grp_disc = merge(x = cust_avg_disc, y = grp_avg_disc[ , c("name_web_segmentation_level_2","bucket","Avg_Grp_Disc_Percent")], 
+                      by = c("name_web_segmentation_level_2","bucket"), all.x=TRUE)
+
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------
+# Adding Bucket_num to dataset
+
+nat = cust_grp_disc
+
+nat$Bucket_num = substring(nat$bucket,1,2)
+
+#--------------------------------------------------------------------------------------------------------------------------------------------------------------- 
+
+# Concept of anchoring
+
+# Anchoring @B6
+
+
+nat$Anchor_B6_Discount =ifelse(nat$Bucket_num =="B6",nat$Avg_Grp_Disc_Percent,
+                               ifelse(nat$Bucket_num =="B5",nat$Avg_Grp_Disc_Percent - 0.02,
+                                      ifelse(nat$Bucket_num =="B4",nat$Avg_Grp_Disc_Percent - 0.04,
+                                             nat$Bucket_num == 0)))
+
+
+# Anchoring @B5
+
+
+nat$Anchor_B5_Discount =ifelse(nat$Bucket_num =="B5",nat$Avg_Grp_Disc_Percent,
+                               ifelse(nat$Bucket_num =="B4",nat$Avg_Grp_Disc_Percent - 0.02,
+                                      ifelse(nat$Bucket_num =="B6",nat$Avg_Grp_Disc_Percent + 0.02,
+                                             nat$Bucket_num == 0)))
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Scenario RHS(3,5,7 percent laddered discount)
+# Scenario LHS (+1 %)
+
+#Laddered Discount Scenarios @AnchorB6,@Anchor B5,Group discount when Avg_cust_disc> anchor@b6/anchor@b5/grpdisc
+
+
+nat$Laddered_Discounts_Anchored_atB6 = ifelse(((nat$Avg_Cust_Disc_Percent - nat$Anchor_B6_Discount  > 0.03 )& (nat$Avg_Cust_Disc_Percent - nat$Anchor_B6_Discount  <= 0.05)),
+                                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.03))) - nat$GROSS_TOTAL_PRICE_GBP,2),
+                                              
+                                              ifelse((nat$Avg_Cust_Disc_Percent - nat$Anchor_B6_Discount  > 0.05)&(nat$Avg_Cust_Disc_Percent - nat$Anchor_B6_Discount  <= 0.07)),
+                                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.05))) - nat$GROSS_TOTAL_PRICE_GBP,2),
+                                              
+                                              ifelse(nat$Avg_Cust_Disc_Percent - nat$Anchor_B6_Discount  > 0.07),
+                                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.07))) - nat$GROSS_TOTAL_PRICE_GBP,2))
+
+
+
+
+nat$Laddered_Discounts_Anchored_atB5 = ifelse(((nat$Avg_Cust_Disc_Percent - nat$Anchor_B5_Discount_Discount  > 0.03 )& (nat$Avg_Cust_Disc_Percent - nat$Anchor_B5_Discount  <= 0.05)),
+                                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.03))) - nat$GROSS_TOTAL_PRICE_GBP,2),
+                                              
+                                              ifelse((nat$Avg_Cust_Disc_Percent - nat$Anchor_B5_Discount  > 0.05)&(nat$Avg_Cust_Disc_Percent - nat$Anchor_B5_Discount  <= 0.07)),
+                                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.05))) - nat$GROSS_TOTAL_PRICE_GBP,2),
+                                              
+                                              ifelse(nat$Avg_Cust_Disc_Percent - nat$Anchor_B5_Discount  > 0.07),
+                                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.07))) - nat$GROSS_TOTAL_PRICE_GBP,2))
+
+
+
+nat$Laddered_Discounts_GroupAvgDiscount = ifelse(((nat$Avg_Cust_Disc_Percent - nat$Avg_Grp_Disc_Percent > 0.03 )& (nat$Avg_Cust_Disc_Percent - nat$Avg_Grp_Disc_Percent  <= 0.05)),
+                                                 round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.03))) - nat$GROSS_TOTAL_PRICE_GBP,2),
+                                                 
+                                                 ifelse((nat$Avg_Cust_Disc_Percent - nat$Avg_Grp_Disc_Percent  > 0.05)&(nat$Avg_Cust_Disc_Percent - nat$Avg_Grp_Disc_Percent  <= 0.07)),
+                                                 round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.05))) - nat$GROSS_TOTAL_PRICE_GBP,2),
+                                                 
+                                                 ifelse(nat$Avg_Cust_Disc_Percent - nat$Avg_Grp_Disc_Percent  > 0.07),
+                                                 round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent- 0.07))) - nat$GROSS_TOTAL_PRICE_GBP,2))
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#Laddered Discount Scenarios @AnchorB6,@Anchor B5,Group discount when Avg_cust_disc < anchor@b6/anchor@b5/grpdisc
+
+nat$LHSAnchored_atB6 = ifelse(nat$Avg_Cust_Disc_Percent - nat$Anchor_B6_Discount  < 0.01,
+                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent +0.01))) - nat$GROSS_TOTAL_PRICE_GBP,2),0)
+
+
+nat$LHSAnchored_atB5 = ifelse(nat$Avg_Cust_Disc_Percent - nat$Anchor_B5_Discount  < 0.01,
+                              round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent +0.01))) - nat$GROSS_TOTAL_PRICE_GBP,2),0)
+
+nat$LHSAnchored_GroupAvgDiscoun = ifelse(nat$Avg_Cust_Disc_Percent - nat$Avg_Grp_Disc_Percent  < 0.01,
+                                         round((nat$GROSS_STD_PRICE_CALC_GBP - (nat$GROSS_STD_PRICE_CALC_GBP * (nat$Avg_Cust_Disc_Percent +0.01))) - nat$GROSS_TOTAL_PRICE_GBP,2),0)
+
+#------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- 
+
+write.csv(nat,"HandToolls_NationalAccounts.csv",row.names = FALSE)
+
+#-------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
